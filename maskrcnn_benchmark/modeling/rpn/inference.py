@@ -9,6 +9,7 @@ from maskrcnn_benchmark.structures.boxlist_ops import remove_small_boxes
 
 from ..utils import cat
 
+from maskrcnn_benchmark import _C as C
 
 class RPNPostProcessor(torch.nn.Module):
     """
@@ -81,36 +82,96 @@ class RPNPostProcessor(torch.nn.Module):
         device = objectness.device
         N, A, H, W = objectness.shape
 
-        # put in the same format as anchors
-        objectness = objectness.permute(0, 2, 3, 1).reshape(N, -1)
-        objectness = objectness.sigmoid()
-        box_regression = box_regression.view(N, -1, 4, H, W).permute(0, 3, 4, 1, 2)
-        box_regression = box_regression.reshape(N, -1, 4)
-
         num_anchors = A * H * W
+        objectness = objectness.reshape(N, -1) # Now [N, AHW]
+        objectness = objectness.sigmoid()
 
         pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
         objectness, topk_idx = objectness.topk(pre_nms_top_n, dim=1, sorted=True)
 
-        batch_idx = torch.arange(N, device=device)[:, None]
-        box_regression = box_regression[batch_idx, topk_idx]
+        use_fast_cuda_path = True
+        # Encompasses box decode, clip_to_image and remove_small_boxes calls
+        if use_fast_cuda_path:
+            # Get all image shapes, and cat them together
+            image_shapes = [box.size for box in anchors]
+            shape_tensors = [torch.tensor(im, device=device).float() for im in image_shapes]
 
-        image_shapes = [box.size for box in anchors]
-        concat_anchors = torch.cat([a.bbox for a in anchors], dim=0)
-        concat_anchors = concat_anchors.reshape(N, -1, 4)[batch_idx, topk_idx]
+            # image_shapes_cat = torch.tensor([box.size for box in anchors], device=objectness.device).float()
+            image_shapes_cat = torch.cat(shape_tensors, dim=0)
 
-        proposals = self.box_coder.decode(
-            box_regression.view(-1, 4), concat_anchors.view(-1, 4)
-        )
+            # Get a single tensor for all anchors
+            concat_anchors = torch.cat([a.bbox for a in anchors], dim=0)
 
-        proposals = proposals.view(N, -1, 4)
+            # Note: Take all anchors, we'll index accordingly inside the kernel
+            # only take the anchors corresponding to the topk boxes
+            concat_anchors = concat_anchors.reshape(N, -1, 4) # [batch_idx, topk_idx]
+
+            # Return pre-nms boxes, associated scores and keep flag
+            # Encompasses:
+            # 1. Box decode
+            # 2. Box clipping
+            # 3. Box filtering
+            # At the end we need to keep only the proposals & scores flagged
+            # Note: topk_idx, objectness are sorted => proposals, objectness, keep are also
+            # sorted -- this is important later
+            proposals, objectness, keep = C.GeneratePreNMSUprightBoxes(
+                                    N,
+                                    A,
+                                    H,
+                                    W,
+                                    topk_idx,
+                                    objectness.float(),    # Need to cast these as kernel doesn't support fp16
+                                    box_regression.float(),
+                                    concat_anchors,
+                                    image_shapes_cat,
+                                    pre_nms_top_n,
+                                    0, # feature_stride
+                                    self.min_size,
+                                    self.box_coder.bbox_xform_clip,
+                                    True)
+
+
+            # view as [N, pre_nms_top_n, 4]
+            proposals = proposals.view(N, -1, 4)
+            objectness = objectness.view(N, -1)
+        else:
+            # reverse the reshape from before ready for permutation
+            objectness = objectness.reshape(N, A, H, W)
+            objectness = objectness.permute(0, 2, 3, 1).reshape(N, -1)
+            # objectness = objectness.sigmoid()
+            # put in the same format as anchors
+            box_regression = box_regression.view(N, -1, 4, H, W).permute(0, 3, 4, 1, 2)
+            box_regression = box_regression.reshape(N, -1, 4)
+
+
+            batch_idx = torch.arange(N, device=device)[:, None]
+            box_regression = box_regression[batch_idx, topk_idx]
+
+            image_shapes = [box.size for box in anchors]
+            concat_anchors = torch.cat([a.bbox for a in anchors], dim=0)
+            concat_anchors = concat_anchors.reshape(N, -1, 4)[batch_idx, topk_idx]
+
+            proposals = self.box_coder.decode(
+                box_regression.view(-1, 4), concat_anchors.view(-1, 4)
+            )
+
+            proposals = proposals.view(N, -1, 4)
+
+        # handle non-fast path without changing the loop at all
+        if not use_fast_cuda_path:
+            keep = [None for _ in range(N)]
 
         result = []
-        for proposal, score, im_shape in zip(proposals, objectness, image_shapes):
-            boxlist = BoxList(proposal, im_shape, mode="xyxy")
+        for proposal, score, im_shape, k in zip(proposals, objectness, image_shapes, keep):
+            if use_fast_cuda_path:
+                p = proposal.masked_select(k[:, None]).view(-1, 4)
+                score = score.masked_select(k)
+                boxlist = BoxList(p, im_shape, mode="xyxy")
+            else:
+                boxlist = BoxList(proposal, im_shape, mode="xyxy")
+                boxlist = boxlist.clip_to_image(remove_empty=False)
+                boxlist = remove_small_boxes(boxlist, self.min_size)
             boxlist.add_field("objectness", score)
-            boxlist = boxlist.clip_to_image(remove_empty=False)
-            boxlist = remove_small_boxes(boxlist, self.min_size)
             boxlist = boxlist_nms(
                 boxlist,
                 self.nms_thresh,
