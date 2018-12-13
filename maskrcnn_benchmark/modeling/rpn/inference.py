@@ -89,15 +89,19 @@ class RPNPostProcessor(torch.nn.Module):
         pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
         objectness, topk_idx = objectness.topk(pre_nms_top_n, dim=1, sorted=True)
 
-        use_fast_cuda_path = True
+        # If inputs are on GPU, use a faster path
+        use_fast_cuda_path = (objectness.is_cuda and box_regression.is_cuda)
         # Encompasses box decode, clip_to_image and remove_small_boxes calls
         if use_fast_cuda_path:
+            objectness = objectness.reshape(N, -1) # Now [N, AHW]
+            objectness = objectness.sigmoid()
+
+            pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
+            objectness, topk_idx = objectness.topk(pre_nms_top_n, dim=1, sorted=True)
+
             # Get all image shapes, and cat them together
             image_shapes = [box.size for box in anchors]
-            shape_tensors = [torch.tensor(im, device=device).float() for im in image_shapes]
-
-            # image_shapes_cat = torch.tensor([box.size for box in anchors], device=objectness.device).float()
-            image_shapes_cat = torch.cat(shape_tensors, dim=0)
+            image_shapes_cat = torch.tensor([box.size for box in anchors], device=objectness.device).float()
 
             # Get a single tensor for all anchors
             concat_anchors = torch.cat([a.bbox for a in anchors], dim=0)
@@ -138,7 +142,11 @@ class RPNPostProcessor(torch.nn.Module):
             # reverse the reshape from before ready for permutation
             objectness = objectness.reshape(N, A, H, W)
             objectness = objectness.permute(0, 2, 3, 1).reshape(N, -1)
-            # objectness = objectness.sigmoid()
+            objectness = objectness.sigmoid()
+
+            pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
+            objectness, topk_idx = objectness.topk(pre_nms_top_n, dim=1, sorted=True)
+
             # put in the same format as anchors
             box_regression = box_regression.view(N, -1, 4, H, W).permute(0, 3, 4, 1, 2)
             box_regression = box_regression.reshape(N, -1, 4)
@@ -157,7 +165,7 @@ class RPNPostProcessor(torch.nn.Module):
 
             proposals = proposals.view(N, -1, 4)
 
-        # handle non-fast path without changing the loop at all
+        # handle non-fast path without changing the loop
         if not use_fast_cuda_path:
             keep = [None for _ in range(N)]
 
