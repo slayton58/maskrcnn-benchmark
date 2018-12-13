@@ -83,11 +83,6 @@ class RPNPostProcessor(torch.nn.Module):
         N, A, H, W = objectness.shape
 
         num_anchors = A * H * W
-        objectness = objectness.reshape(N, -1) # Now [N, AHW]
-        objectness = objectness.sigmoid()
-
-        pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
-        objectness, topk_idx = objectness.topk(pre_nms_top_n, dim=1, sorted=True)
 
         # If inputs are on GPU, use a faster path
         use_fast_cuda_path = (objectness.is_cuda and box_regression.is_cuda)
@@ -129,7 +124,6 @@ class RPNPostProcessor(torch.nn.Module):
                                     concat_anchors,
                                     image_shapes_cat,
                                     pre_nms_top_n,
-                                    0, # feature_stride
                                     self.min_size,
                                     self.box_coder.bbox_xform_clip,
                                     True)
@@ -172,6 +166,8 @@ class RPNPostProcessor(torch.nn.Module):
         result = []
         for proposal, score, im_shape, k in zip(proposals, objectness, image_shapes, keep):
             if use_fast_cuda_path:
+                # Note: Want k to be applied per-image instead of all-at-once in batched code earlier
+                #       clip_to_image and remove_small_boxes already done in single kernel
                 p = proposal.masked_select(k[:, None]).view(-1, 4)
                 score = score.masked_select(k)
                 boxlist = BoxList(p, im_shape, mode="xyxy")

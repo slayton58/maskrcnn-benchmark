@@ -19,7 +19,6 @@ std::vector<at::Tensor> GeneratePreNMSUprightBoxes(
     at::Tensor& anchors,        // input (full, unsorted, unsliced)
     at::Tensor& image_shapes,   // (h, w) of images
     const int pre_nms_nboxes,
-    const int feature_stride,
     const int rpn_min_size,
     const float bbox_xform_clip_default,
     const bool correct_transform_coords);

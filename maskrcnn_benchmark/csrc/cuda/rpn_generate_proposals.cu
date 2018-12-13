@@ -19,8 +19,6 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <THC/THC.h>
-#include <THC/THCAtomics.cuh>
-#include <THC/THCDeviceUtils.cuh>
 
 namespace {
 
@@ -59,7 +57,6 @@ __global__ void GeneratePreNMSUprightBoxesKernel(
 		const int K, // K = H*W
 		const int A,
 		const int KA, // KA = K*A
-		const float feat_stride,
 		const float min_size,
 		const float *d_img_info_vec,
 		const int num_images,
@@ -157,7 +154,7 @@ __global__ void GeneratePreNMSUprightBoxesKernel(
       // Removing boxes with one dim < min_size
       // (center of box is in image, because of previous step)
       // keep = _filter_boxes(p, self.min_size, im_shape)
-      width = x2 - x1 + 1.0f; // may have changed
+      width = x2 - x1 + 1.0f;
       height = y2 - y1 + 1.0f;
       bool keep_box = fmin(width, height) >= min_size_scaled;
       // We are not deleting the box right now even if !keep_box
@@ -166,14 +163,8 @@ __global__ void GeneratePreNMSUprightBoxesKernel(
       // d_boxes_keep_flags size: (num_images,prenms_nboxes)
       // d_out_boxes size: (num_images,prenms_nboxes)
       const int out_index = image_index * prenms_nboxes + ibox;
-      d_boxes_keep_flags[out_index] = true; // keep_box;
+      d_boxes_keep_flags[out_index] = keep_box;
       d_out_boxes[out_index] = {x1,y1,x2,y2};
-
-      // d_inout_scores size: (num_images,KA)
-      // In PyT code this part doesn't happen
-      //if (!keep_box) {
-      //  d_inout_scores[image_index * prenms_nboxes+ibox] = FLT_MIN; // for NMS
-      //}
     }
   }
 }
@@ -195,14 +186,12 @@ std::vector<at::Tensor> GeneratePreNMSUprightBoxes(
         at::Tensor& anchors,        // input (full, unsorted, unsliced)
         at::Tensor& image_shapes,   // (h, w) of images
         const int pre_nms_nboxes,
-        const int feature_stride,
         const int rpn_min_size,
         const float bbox_xform_clip_default,
         const bool correct_transform_coords) {
   // constants
   constexpr int box_dim = 4;
   const int K = H * W;
-  const int conv_layer_nboxes = K * A;
 
   // temp Tensors
   at::Tensor boxes = at::zeros({num_images, box_dim * pre_nms_nboxes}, sorted_scores.options()).to(at::kFloat);
@@ -224,7 +213,6 @@ std::vector<at::Tensor> GeneratePreNMSUprightBoxes(
           K,
           A,
           K * A,
-          feature_stride,
           rpn_min_size,
           image_shapes.data<float>(), // image size vec
           num_images,
